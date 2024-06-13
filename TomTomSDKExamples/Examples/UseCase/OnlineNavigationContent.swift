@@ -14,6 +14,7 @@ import Foundation
 import SwiftUI
 
 // TomTomSDK modules
+import TomTomSDKCommonUI
 import TomTomSDKDefaultTextToSpeech
 import TomTomSDKLocationProvider
 import TomTomSDKMapDisplay
@@ -67,12 +68,19 @@ final class NavigationController: ObservableObject {
         }
         let navigationModel = TomTomSDKNavigationUI.NavigationView.ViewModel(navigation, tts: textToSpeech)
 
+        let speedLimitViewModel = SpeedLimitViewModel(
+            speed: .tt.kilometersPerHour(.zero),
+            speedThreshold: .tt.kilometersPerHour(50),
+            speedUnit: .kilometersPerHour
+        )
+
         self.init(
             locationProvider: locationProvider,
             simulatedLocationProvider: simulatedLocationProvider,
             routePlanner: routePlanner,
             navigation: navigation,
-            navigationModel: navigationModel
+            navigationModel: navigationModel,
+            speedLimitViewModel: speedLimitViewModel
         )
     }
 
@@ -81,19 +89,22 @@ final class NavigationController: ObservableObject {
         simulatedLocationProvider: SimulatedLocationProvider,
         routePlanner: TomTomSDKRoutePlannerOnline.OnlineRoutePlanner,
         navigation: TomTomNavigation,
-        navigationModel: TomTomSDKNavigationUI.NavigationView.ViewModel
+        navigationModel: TomTomSDKNavigationUI.NavigationView.ViewModel,
+        speedLimitViewModel: TomTomSDKCommonUI.SpeedLimitViewModel
     ) {
         self.locationProvider = locationProvider
         self.simulatedLocationProvider = simulatedLocationProvider
         self.routePlanner = routePlanner
         self.navigation = navigation
         navigationViewModel = navigationModel
+        self.speedLimitViewModel = speedLimitViewModel
 
         self.navigation.addProgressObserver(self)
         self.navigation.addRouteAddObserver(self)
         self.navigation.addRouteRemoveObserver(self)
         self.navigation.addRouteUpdateObserver(self)
         self.navigation.addActiveRouteChangeObserver(self)
+        self.navigation.addLocationContextObserver(self)
         locationManager.requestWhenInUseAuthorization()
         locationProvider.enable()
     }
@@ -106,6 +117,7 @@ final class NavigationController: ObservableObject {
     let routePlanner: TomTomSDKRoutePlannerOnline.OnlineRoutePlanner
     let navigation: TomTomNavigation
     let navigationViewModel: TomTomSDKNavigationUI.NavigationView.ViewModel
+    let speedLimitViewModel: TomTomSDKCommonUI.SpeedLimitViewModel
 
     let displayedRouteSubject = PassthroughSubject<TomTomSDKRoute.Route?, Never>()
     let progressOnRouteSubject = PassthroughSubject<Measurement<UnitLength>, Never>()
@@ -157,6 +169,30 @@ extension NavigationController: TomTomSDKNavigation.NavigationRouteAddObserver,
     func didUpdateRoute(route _: TomTomSDKRoute.Route, reason _: TomTomSDKNavigation.RouteUpdatedReason) {}
 }
 
+// MARK: Navigation Location Context Observer
+
+extension NavigationController: TomTomSDKNavigation.NavigationLocationContextObserver {
+    func didDetectLocationContext(locationContext: LocationContext) {
+        let currentSpeed = locationContext.speed
+        let currentSpeedLimit: Measurement<UnitSpeed>? = {
+            if let speedLimitInfo = locationContext.speedLimit {
+                switch speedLimitInfo {
+                case let .limited(speed):
+                    return speed
+                case .unlimited:
+                    return nil
+                @unknown default:
+                    fatalError("Unknown speed limit case")
+                }
+            }
+            return nil
+        }()
+
+        speedLimitViewModel.speed = currentSpeed
+        speedLimitViewModel.speedLimit = currentSpeedLimit
+    }
+}
+
 // MARK: - MainView
 
 struct MainView: View {
@@ -170,6 +206,11 @@ struct MainView: View {
                     navigationController.navigationViewModel,
                     action: navigationController.onNavigationViewAction
                 )
+            } else {
+                SpeedLimitView(viewModel: navigationController.speedLimitViewModel)
+                    .padding()
+                    .offset(y: -UIScreen.main.bounds.height / 2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .onDisappear {
@@ -392,27 +433,63 @@ extension NavigationController {
     func navigateToCoordinate(_ destination: CLLocationCoordinate2D) {
         Task { @MainActor in
             do {
-                // Plan the route and add it to the map
-                let start = try startCoordinate()
-                let routePlan = try await planRoute(from: start, to: destination)
+                let freeDriving = true
 
-                stopNavigating()
+                if freeDriving {
+                    try self.navigation.start()
 
-                let route = routePlan.route
-                self.displayedRouteSubject.send(route)
+                    let geometry = [
+                        (52.3621, 4.89977),
+                        (52.36215, 4.90003),
+                        (52.36219, 4.9003),
+                        (52.36223, 4.9005),
+                        (52.36227, 4.90072),
+                        (52.3623, 4.90087),
+                        (52.36232, 4.90101),
+                        (52.36236, 4.90114),
+                        (52.36238, 4.9013),
+                        (52.36241, 4.90148),
+                        (52.36244, 4.90167),
+                        (52.36247, 4.90179),
+                        (52.36249, 4.90194),
+                        (52.36252, 4.90212),
+                        (52.36245, 4.90216),
+                        (52.36237, 4.9022),
+                        (52.36227, 4.90226),
+                        (52.36219, 4.90229),
+                        (52.3621, 4.90234),
+                        (52.36205, 4.9021),
+                        (52.36202, 4.90192),
+                        (52.36199, 4.90171),
+                        (52.36194, 4.90147),
+                    ]
+                    let coordinates = geometry.map { CLLocationCoordinate2D(latitude: $0.0, longitude: $0.1) }
+                    self.simulatedLocationProvider.updateCoordinates(coordinates)
+                    self.simulatedLocationProvider.enable()
+                    self.mapMatchedLocationProvider.send(navigation.mapMatchedLocationProvider)
+                } else {
+                    // Plan the route and add it to the map
+                    let start = try startCoordinate()
+                    let routePlan = try await planRoute(from: start, to: destination)
 
-                let navigationOptions = NavigationOptions(activeRoutePlan: routePlan)
-                self.navigationViewModel.start(navigationOptions)
+                    stopNavigating()
 
-                // Start navigation after a short delay so that we can clearly see the transition to the driving view
-                try await Task.sleep(nanoseconds: UInt64(1.0 * 1_000_000_000))
+                    let route = routePlan.route
+                    self.displayedRouteSubject.send(route)
 
-                // Use simulated location updates
-                self.simulatedLocationProvider.updateCoordinates(route.geometry, interpolate: true)
-                self.simulatedLocationProvider.enable()
-                self.mapMatchedLocationProvider.send(navigation.mapMatchedLocationProvider)
+                    let navigationOptions = NavigationOptions(activeRoutePlan: routePlan)
+                    self.navigationViewModel.start(navigationOptions)
 
-                self.showNavigationView = true
+                    // Start navigation after a short delay so that we can clearly see the transition to the driving view
+                    try await Task.sleep(nanoseconds: UInt64(1.0 * 1_000_000_000))
+
+                    // Use simulated location updates
+                    self.simulatedLocationProvider.updateCoordinates(route.geometry, interpolate: true)
+                    self.simulatedLocationProvider.enable()
+                    self.mapMatchedLocationProvider.send(navigation.mapMatchedLocationProvider)
+
+                    self.showNavigationView = true
+                }
             } catch {
                 print("Error when planning a route: \(error)")
             }
